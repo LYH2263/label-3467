@@ -7,6 +7,7 @@ import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 
 import java.util.List;
+import java.util.Map;
 
 public interface CommentRepository extends JpaRepository<Comment, Long> {
     List<Comment> findByArticleIdOrderByCreatedAtAsc(Long articleId);
@@ -22,4 +23,12 @@ public interface CommentRepository extends JpaRepository<Comment, Long> {
     @Modifying
     @Query("delete from Comment c where c.article.id = :articleId")
     int deleteByArticleId(@Param("articleId") Long articleId);
+
+    @Query("""
+            select c.article.id as articleId, count(c) as commentCount
+            from Comment c
+            where c.article.id in :articleIds
+            group by c.article.id
+            """)
+    List<Map<String, Object>> countByArticleIds(@Param("articleIds") List<Long> articleIds);
 }
