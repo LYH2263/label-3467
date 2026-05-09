@@ -1,0 +1,67 @@
+spring:
+  datasource:
+    url: ${SPRING_DATASOURCE_URL:jdbc:mysql://db:3306/psyche_game?useUnicode=true&characterEncoding=utf8&useSSL=false&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true}
+    username: ${SPRING_DATASOURCE_USERNAME:root}
+    password: ${SPRING_DATASOURCE_PASSWORD:root123}
+    driver-class-name: com.mysql.cj.jdbc.Driver
+  jpa:
+    hibernate:
+      ddl-auto: update
+    open-in-view: false
+    show-sql: false
+    defer-datasource-initialization: true
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.MySQLDialect
+        format_sql: false
+  sql:
+    init:
+      mode: always
+      continue-on-error: true
+  data:
+    redis:
+      host: ${SPRING_REDIS_HOST:redis}
+      port: ${SPRING_REDIS_PORT:6379}
+  servlet:
+    multipart:
+      max-file-size: 8MB
+      max-request-size: 16MB
+
+server:
+  port: 8080
+  forward-headers-strategy: framework
+
+jwt:
+  secret: ${JWT_SECRET:PsycheGameJwtSecretForProdPleaseChangeThisToLongSecureString123456789}
+  expiration-ms: 7200000
+  remember-expiration-ms: 604800000
+
+app:
+  frontend-url: ${APP_FRONTEND_URL:http://localhost:3467}
+  upload-dir: ${APP_UPLOAD_DIR:/app/uploads}
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus
+  endpoint:
+    health:
+      probes:
+        enabled: true
+
+springdoc:
+  api-docs:
+    path: /api-docs
+  swagger-ui:
+    path: /swagger-ui
+
+logging:
+  file:
+    name: /var/log/blog/backend.log
+  level:
+    root: INFO
+    com.blogplatform: INFO
+  pattern:
+    console: "%d{yyyy-MM-dd HH:mm:ss} [%level] %logger{36} - %msg%n"
+    file: "%d{yyyy-MM-dd HH:mm:ss} [%level] %logger{36} - %msg%n"
