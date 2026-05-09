@@ -7,6 +7,7 @@ import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 
 public interface FavoriteRepository extends JpaRepository<Favorite, Long> {
@@ -23,4 +24,12 @@ public interface FavoriteRepository extends JpaRepository<Favorite, Long> {
     @Modifying
     @Query("delete from Favorite f where f.article.id = :articleId")
     int deleteByArticleId(@Param("articleId") Long articleId);
+
+    @Query("""
+            select f.article.id as articleId, count(f) as favoriteCount
+            from Favorite f
+            where f.article.id in :articleIds
+            group by f.article.id
+            """)
+    List<Map<String, Object>> countByArticleIds(@Param("articleIds") List<Long> articleIds);
 }
