@@ -4,15 +4,11 @@ import com.blogplatform.dto.*;
 import com.blogplatform.entity.*;
 import com.blogplatform.exception.BusinessException;
 import com.blogplatform.repository.*;
+import com.blogplatform.util.ArticleMetricsCalculator;
 import com.blogplatform.util.HtmlSanitizer;
 import com.blogplatform.util.SlugUtil;
 import jakarta.persistence.criteria.Predicate;
 import lombok.RequiredArgsConstructor;
-import org.apache.poi.ss.usermodel.CellStyle;
-import org.apache.poi.ss.usermodel.Font;
-import org.apache.poi.ss.usermodel.HorizontalAlignment;
-import org.apache.poi.xssf.usermodel.XSSFSheet;
-import org.apache.poi.xssf.usermodel.XSSFWorkbook;
 import org.jsoup.Jsoup;
 import org.springframework.cache.annotation.CacheEvict;
 import org.springframework.cache.annotation.Cacheable;
@@ -27,51 +23,50 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.util.HtmlUtils;
 
-import java.io.ByteArrayOutputStream;
-import java.io.IOException;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
-import java.time.format.DateTimeFormatter;
 import java.util.*;
-import java.util.stream.Collectors;
 
 @Service
 @RequiredArgsConstructor
 public class ArticleService {
 
-    private final ArticleRepository articleRepository;
-    private final CategoryRepository categoryRepository;
-    private final TagRepository tagRepository;
-    private final ArticleRevisionRepository revisionRepository;
-    private final FavoriteRepository favoriteRepository;
-    private final ShareStatRepository shareStatRepository;
-    private final CommentRepository commentRepository;
+    private final ArticleRepository articleRepo;
+    private final CategoryRepository categoryRepo;
+    private final TagRepository tagRepo;
+    private final ArticleRevisionRepository revisionRepo;
+    private final FavoriteRepository favoriteRepo;
+    private final ShareStatRepository shareStatRepo;
+    private final CommentRepository commentRepo;
     private final HtmlSanitizer htmlSanitizer;
+    private final TagService tagSvc;
+    private final ArticleExcelExporter excelExporterSvc;
+    private final ArticleMetricsCalculator metricsCalculator = ArticleMetricsCalculator.INSTANCE;
 
     @Transactional
     @CacheEvict(value = {"articleList", "articleDetail", "relatedArticles"}, allEntries = true)
     public ArticleSummaryResponse createArticle(ArticleRequest request, User currentUser) {
-        Category category = categoryRepository.findById(request.getCategoryId())
+        Category category = categoryRepo.findById(request.getCategoryId())
                 .orElseThrow(() -> new BusinessException("分类不存在"));
 
         Article article = new Article();
-        applyArticleChanges(article, request, category);
+        doApplyArticleChanges(article, request, category);
         article.setAuthor(currentUser);
 
-        String slug = generateUniqueSlug(request.getTitle());
+        String slug = doGenerateUniqueSlug(request.getTitle());
         article.setSlug(slug);
 
-        Article saved = articleRepository.save(article);
-        return toSummary(saved);
+        Article saved = articleRepo.save(article);
+        return toSummary(new ArticleWithMetrics(saved, 0, 0));
     }
 
     @Transactional
     @CacheEvict(value = {"articleList", "articleDetail", "relatedArticles"}, allEntries = true)
     public ArticleSummaryResponse updateArticle(Long articleId, ArticleRequest request, User currentUser) {
-        Article article = articleRepository.findById(articleId)
+        Article article = articleRepo.findById(articleId)
                 .orElseThrow(() -> new BusinessException(HttpStatus.NOT_FOUND, "文章不存在"));
 
-        validateArticlePermission(article, currentUser);
+        doValidateArticlePermission(article, currentUser);
 
         ArticleRevision revision = new ArticleRevision();
         revision.setArticle(article);
@@ -81,38 +76,37 @@ public class ArticleService {
         revision.setContentHtml(article.getContentHtml());
         revision.setChangeNote(request.getChangeNote() == null ? "内容更新" : request.getChangeNote());
         revision.setCreatedBy(currentUser.getUsername());
-        revisionRepository.save(revision);
+        revisionRepo.save(revision);
 
-        Category category = categoryRepository.findById(request.getCategoryId())
+        Category category = categoryRepo.findById(request.getCategoryId())
                 .orElseThrow(() -> new BusinessException("分类不存在"));
 
         boolean titleChanged = !article.getTitle().equals(request.getTitle());
-        applyArticleChanges(article, request, category);
+        doApplyArticleChanges(article, request, category);
 
         if (titleChanged) {
-            article.setSlug(generateUniqueSlug(request.getTitle()));
+            article.setSlug(doGenerateUniqueSlug(request.getTitle()));
         }
 
-        Article saved = articleRepository.save(article);
-        return toSummary(saved);
+        Article saved = articleRepo.save(article);
+        return toSummary(new ArticleWithMetrics(saved, 0, 0));
     }
 
     @Transactional
     @CacheEvict(value = {"articleList", "articleDetail", "relatedArticles"}, allEntries = true)
     public void deleteArticle(Long articleId, User currentUser) {
-        Article article = articleRepository.findById(articleId)
+        Article article = articleRepo.findById(articleId)
                 .orElseThrow(() -> new BusinessException(HttpStatus.NOT_FOUND, "文章不存在"));
 
-        validateArticlePermission(article, currentUser);
+        doValidateArticlePermission(article, currentUser);
         try {
-            // 先清理关联数据，避免外键约束导致删除失败
-            commentRepository.clearParentRelationByArticleId(articleId);
-            commentRepository.deleteByArticleId(articleId);
-            favoriteRepository.deleteByArticleId(articleId);
-            shareStatRepository.deleteByArticleId(articleId);
-            revisionRepository.deleteByArticleId(articleId);
-            articleRepository.deleteTagRelationsByArticleId(articleId);
-            articleRepository.delete(article);
+            commentRepo.clearParentRelationByArticleId(articleId);
+            commentRepo.deleteByArticleId(articleId);
+            favoriteRepo.deleteByArticleId(articleId);
+            shareStatRepo.deleteByArticleId(articleId);
+            revisionRepo.deleteByArticleId(articleId);
+            articleRepo.deleteTagRelationsByArticleId(articleId);
+            articleRepo.delete(article);
         } catch (DataIntegrityViolationException ex) {
             throw new BusinessException(HttpStatus.CONFLICT, "文章存在关联数据，暂时无法删除");
         }
@@ -127,12 +121,14 @@ public class ArticleService {
                                                         int page,
                                                         int size) {
         Pageable pageable = PageRequest.of(page, Math.min(size, 30));
-        Specification<Article> spec = buildSearchSpec(keyword, categoryId, startDate, endDate, true, null);
-        Page<Article> articles = articleRepository.findAll(spec, pageable);
+        Specification<Article> spec = doBuildSearchSpec(keyword, categoryId, startDate, endDate, true, null);
+        Page<Article> articles = articleRepo.findAll(spec, pageable);
 
-        List<ArticleSummaryResponse> data = articles.getContent().stream()
+        List<ArticleWithMetrics> articlesWithMetrics = doFetchMetrics(articles.getContent());
+
+        List<ArticleSummaryResponse> data = articlesWithMetrics.stream()
                 .map(this::toSummary)
-                .collect(Collectors.toList());
+                .toList();
 
         return new PageImpl<>(data, pageable, articles.getTotalElements());
     }
@@ -140,9 +136,11 @@ public class ArticleService {
     @Transactional(readOnly = true)
     public Page<ArticleSummaryResponse> searchMine(User currentUser, int page, int size) {
         Pageable pageable = PageRequest.of(page, Math.min(size, 20));
-        Page<Article> articles = articleRepository.findByAuthorIdOrderByUpdatedAtDesc(currentUser.getId(), pageable);
+        Page<Article> articles = articleRepo.findByAuthorIdOrderByUpdatedAtDesc(currentUser.getId(), pageable);
 
-        List<ArticleSummaryResponse> data = articles.getContent().stream()
+        List<ArticleWithMetrics> articlesWithMetrics = doFetchMetrics(articles.getContent());
+
+        List<ArticleSummaryResponse> data = articlesWithMetrics.stream()
                 .map(this::toSummary)
                 .toList();
 
@@ -151,62 +149,17 @@ public class ArticleService {
 
     @Transactional(readOnly = true)
     public byte[] exportMineAnalytics(User currentUser) {
-        List<Article> articles = articleRepository.findByAuthorIdOrderByUpdatedAtDesc(currentUser.getId());
-        DateTimeFormatter formatter = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm");
-
-        try (XSSFWorkbook workbook = new XSSFWorkbook(); ByteArrayOutputStream outputStream = new ByteArrayOutputStream()) {
-            XSSFSheet sheet = workbook.createSheet("PsycheGame-Analytics");
-
-            CellStyle headerStyle = workbook.createCellStyle();
-            Font headerFont = workbook.createFont();
-            headerFont.setBold(true);
-            headerStyle.setFont(headerFont);
-            headerStyle.setAlignment(HorizontalAlignment.CENTER);
-
-            String[] headers = {"ID", "标题", "分类", "状态", "浏览量", "点赞量", "评论数", "热度评分", "最后更新"};
-            var headerRow = sheet.createRow(0);
-            for (int i = 0; i < headers.length; i++) {
-                var cell = headerRow.createCell(i);
-                cell.setCellValue(headers[i]);
-                cell.setCellStyle(headerStyle);
-            }
-
-            int rowIndex = 1;
-            for (Article article : articles) {
-                long likes = favoriteRepository.countByArticleId(article.getId());
-                long comments = commentRepository.countByArticleId(article.getId());
-                int views = article.getViewCount() == null ? 0 : article.getViewCount();
-                long score = views + likes * 4 + comments * 2;
-
-                var row = sheet.createRow(rowIndex++);
-                row.createCell(0).setCellValue(article.getId());
-                row.createCell(1).setCellValue(article.getTitle());
-                row.createCell(2).setCellValue(article.getCategory().getName());
-                row.createCell(3).setCellValue(article.getStatus().name());
-                row.createCell(4).setCellValue(views);
-                row.createCell(5).setCellValue(likes);
-                row.createCell(6).setCellValue(comments);
-                row.createCell(7).setCellValue(score);
-                row.createCell(8).setCellValue(article.getUpdatedAt() == null ? "-" : article.getUpdatedAt().format(formatter));
-            }
-
-            for (int i = 0; i < headers.length; i++) {
-                sheet.autoSizeColumn(i);
-            }
-
-            workbook.write(outputStream);
-            return outputStream.toByteArray();
-        } catch (IOException ex) {
-            throw new BusinessException(HttpStatus.INTERNAL_SERVER_ERROR, "导出作者数据失败");
-        }
+        return excelExporterSvc.exportMineAnalytics(currentUser);
     }
 
     @Transactional(readOnly = true)
     public Page<ArticleSummaryResponse> searchAllForAdmin(int page, int size) {
         Pageable pageable = PageRequest.of(page, Math.min(size, 30));
-        Page<Article> articles = articleRepository.findAllByOrderByUpdatedAtDesc(pageable);
+        Page<Article> articles = articleRepo.findAllByOrderByUpdatedAtDesc(pageable);
 
-        List<ArticleSummaryResponse> data = articles.getContent().stream()
+        List<ArticleWithMetrics> articlesWithMetrics = doFetchMetrics(articles.getContent());
+
+        List<ArticleSummaryResponse> data = articlesWithMetrics.stream()
                 .map(this::toSummary)
                 .toList();
 
@@ -215,7 +168,7 @@ public class ArticleService {
 
     @Transactional
     public ArticleDetailResponse getArticleDetail(Long articleId, User viewer) {
-        Article article = articleRepository.findById(articleId)
+        Article article = articleRepo.findById(articleId)
                 .orElseThrow(() -> new BusinessException(HttpStatus.NOT_FOUND, "文章不存在"));
 
         if (article.getStatus() != ArticleStatus.PUBLISHED) {
@@ -231,17 +184,20 @@ public class ArticleService {
 
         article.setViewCount(article.getViewCount() + 1);
 
-        List<Map<String, Object>> shareStats = shareStatRepository.findByArticleId(articleId).stream()
+        List<Map<String, Object>> shareStats = shareStatRepo.findByArticleId(articleId).stream()
                 .map(share -> Map.<String, Object>of(
                         "platform", share.getPlatform(),
                         "shareCount", share.getShareCount()
                 ))
                 .toList();
 
-        boolean favorited = viewer != null && favoriteRepository.existsByUserIdAndArticleId(viewer.getId(), articleId);
+        boolean favorited = viewer != null && favoriteRepo.existsByUserIdAndArticleId(viewer.getId(), articleId);
+
+        long favoriteCount = favoriteRepo.countByArticleId(articleId);
+        long commentCount = commentRepo.countByArticleId(articleId);
 
         return ArticleDetailResponse.builder()
-                .article(toSummary(article))
+                .article(toSummary(new ArticleWithMetrics(article, favoriteCount, commentCount)))
                 .contentMarkdown(article.getContentMarkdown())
                 .contentHtml(article.getContentHtml())
                 .shareStats(shareStats)
@@ -251,22 +207,25 @@ public class ArticleService {
 
     @Transactional(readOnly = true)
     public ArticleDetailResponse getArticleForEdit(Long articleId, User currentUser) {
-        Article article = articleRepository.findById(articleId)
+        Article article = articleRepo.findById(articleId)
                 .orElseThrow(() -> new BusinessException(HttpStatus.NOT_FOUND, "文章不存在"));
 
-        validateArticlePermission(article, currentUser);
+        doValidateArticlePermission(article, currentUser);
 
-        List<Map<String, Object>> shareStats = shareStatRepository.findByArticleId(articleId).stream()
+        List<Map<String, Object>> shareStats = shareStatRepo.findByArticleId(articleId).stream()
                 .map(share -> Map.<String, Object>of(
                         "platform", share.getPlatform(),
                         "shareCount", share.getShareCount()
                 ))
                 .toList();
 
-        boolean favorited = favoriteRepository.existsByUserIdAndArticleId(currentUser.getId(), articleId);
+        boolean favorited = favoriteRepo.existsByUserIdAndArticleId(currentUser.getId(), articleId);
+
+        long favoriteCount = favoriteRepo.countByArticleId(articleId);
+        long commentCount = commentRepo.countByArticleId(articleId);
 
         return ArticleDetailResponse.builder()
-                .article(toSummary(article))
+                .article(toSummary(new ArticleWithMetrics(article, favoriteCount, commentCount)))
                 .contentMarkdown(article.getContentMarkdown())
                 .contentHtml(article.getContentHtml())
                 .shareStats(shareStats)
@@ -276,12 +235,12 @@ public class ArticleService {
 
     @Transactional(readOnly = true)
     public List<ArticleRevisionResponse> listRevisions(Long articleId, User currentUser) {
-        Article article = articleRepository.findById(articleId)
+        Article article = articleRepo.findById(articleId)
                 .orElseThrow(() -> new BusinessException(HttpStatus.NOT_FOUND, "文章不存在"));
 
-        validateArticlePermission(article, currentUser);
+        doValidateArticlePermission(article, currentUser);
 
-        return revisionRepository.findByArticleIdOrderByCreatedAtDesc(articleId).stream()
+        return revisionRepo.findByArticleIdOrderByCreatedAtDesc(articleId).stream()
                 .map(revision -> ArticleRevisionResponse.builder()
                         .id(revision.getId())
                         .title(revision.getTitle())
@@ -298,36 +257,36 @@ public class ArticleService {
     @Transactional
     @CacheEvict(value = {"articleDetail", "articleList", "relatedArticles"}, allEntries = true)
     public Map<String, Object> toggleFavorite(Long articleId, User currentUser) {
-        Article article = articleRepository.findById(articleId)
+        Article article = articleRepo.findById(articleId)
                 .orElseThrow(() -> new BusinessException(HttpStatus.NOT_FOUND, "文章不存在"));
 
-        Optional<Favorite> existing = favoriteRepository.findByUserIdAndArticleId(currentUser.getId(), articleId);
+        Optional<Favorite> existing = favoriteRepo.findByUserIdAndArticleId(currentUser.getId(), articleId);
         boolean favorited;
         if (existing.isPresent()) {
-            favoriteRepository.delete(existing.get());
+            favoriteRepo.delete(existing.get());
             favorited = false;
         } else {
             Favorite favorite = new Favorite();
             favorite.setUser(currentUser);
             favorite.setArticle(article);
-            favoriteRepository.save(favorite);
+            favoriteRepo.save(favorite);
             favorited = true;
         }
 
         return Map.of(
                 "favorited", favorited,
-                "favoriteCount", favoriteRepository.countByArticleId(articleId)
+                "favoriteCount", favoriteRepo.countByArticleId(articleId)
         );
     }
 
     @Transactional
     public Map<String, Object> shareArticle(Long articleId, String platform) {
-        Article article = articleRepository.findById(articleId)
+        Article article = articleRepo.findById(articleId)
                 .orElseThrow(() -> new BusinessException(HttpStatus.NOT_FOUND, "文章不存在"));
 
         String normalizedPlatform = (platform == null || platform.isBlank()) ? "link" : platform.toLowerCase();
 
-        ShareStat shareStat = shareStatRepository.findByArticleIdAndPlatform(articleId, normalizedPlatform)
+        ShareStat shareStat = shareStatRepo.findByArticleIdAndPlatform(articleId, normalizedPlatform)
                 .orElseGet(() -> {
                     ShareStat stat = new ShareStat();
                     stat.setArticle(article);
@@ -337,7 +296,7 @@ public class ArticleService {
                 });
 
         shareStat.setShareCount(shareStat.getShareCount() + 1);
-        shareStatRepository.save(shareStat);
+        shareStatRepo.save(shareStat);
 
         return Map.of(
                 "platform", normalizedPlatform,
@@ -349,12 +308,12 @@ public class ArticleService {
     @Transactional(readOnly = true)
     @Cacheable(value = "relatedArticles", key = "#articleId")
     public List<ArticleSummaryResponse> getRelatedArticles(Long articleId) {
-        Article article = articleRepository.findById(articleId)
+        Article article = articleRepo.findById(articleId)
                 .orElseThrow(() -> new BusinessException(HttpStatus.NOT_FOUND, "文章不存在"));
 
         LinkedHashMap<Long, Article> related = new LinkedHashMap<>();
 
-        List<Article> sameCategory = articleRepository.findTop5ByCategoryIdAndIdNotAndStatusOrderByPublishedAtDesc(
+        List<Article> sameCategory = articleRepo.findTop5ByCategoryIdAndIdNotAndStatusOrderByPublishedAtDesc(
                 article.getCategory().getId(),
                 article.getId(),
                 ArticleStatus.PUBLISHED
@@ -365,7 +324,7 @@ public class ArticleService {
 
         if (related.size() < 5 && !article.getTags().isEmpty()) {
             List<Long> tagIds = article.getTags().stream().map(Tag::getId).toList();
-            List<Article> tagRelated = articleRepository.findRelatedByTags(
+            List<Article> tagRelated = articleRepo.findRelatedByTags(
                     tagIds,
                     article.getId(),
                     ArticleStatus.PUBLISHED,
@@ -380,17 +339,26 @@ public class ArticleService {
             }
         }
 
-        return related.values().stream().limit(5).map(this::toSummary).toList();
+        List<ArticleWithMetrics> articlesWithMetrics = doFetchMetrics(related.values().stream().toList());
+        return articlesWithMetrics.stream().limit(5).map(this::toSummary).toList();
     }
 
     @Transactional(readOnly = true)
     public Article getArticleEntity(Long articleId) {
-        return articleRepository.findById(articleId)
+        return articleRepo.findById(articleId)
                 .orElseThrow(() -> new BusinessException(HttpStatus.NOT_FOUND, "文章不存在"));
     }
 
     @Transactional(readOnly = true)
     public ArticleSummaryResponse toSummary(Article article) {
+        long favoriteCount = favoriteRepo.countByArticleId(article.getId());
+        long commentCount = commentRepo.countByArticleId(article.getId());
+        return toSummary(new ArticleWithMetrics(article, favoriteCount, commentCount));
+    }
+
+    @Transactional(readOnly = true)
+    public ArticleSummaryResponse toSummary(ArticleWithMetrics articleWithMetrics) {
+        Article article = articleWithMetrics.article();
         return ArticleSummaryResponse.builder()
                 .id(article.getId())
                 .title(article.getTitle())
@@ -402,18 +370,36 @@ public class ArticleService {
                 .author(article.getAuthor().getUsername())
                 .status(article.getStatus())
                 .viewCount(article.getViewCount())
-                .favoriteCount(favoriteRepository.countByArticleId(article.getId()))
-                .commentCount(commentRepository.countByArticleId(article.getId()))
+                .favoriteCount(articleWithMetrics.favoriteCount())
+                .commentCount(articleWithMetrics.commentCount())
                 .publishedAt(article.getPublishedAt())
                 .updatedAt(article.getUpdatedAt())
                 .build();
     }
 
-    private void applyArticleChanges(Article article, ArticleRequest request, Category category) {
+    private List<ArticleWithMetrics> doFetchMetrics(List<Article> articles) {
+        if (articles.isEmpty()) {
+            return List.of();
+        }
+
+        List<Long> articleIds = articles.stream().map(Article::getId).toList();
+        Map<Long, Long> favoriteCounts = articleRepo.getFavoriteCounts(articleIds);
+        Map<Long, Long> commentCounts = articleRepo.getCommentCounts(articleIds);
+
+        return articles.stream()
+                .map(article -> new ArticleWithMetrics(
+                        article,
+                        favoriteCounts.getOrDefault(article.getId(), 0L),
+                        commentCounts.getOrDefault(article.getId(), 0L)
+                ))
+                .toList();
+    }
+
+    private void doApplyArticleChanges(Article article, ArticleRequest request, Category category) {
         article.setTitle(request.getTitle().trim());
         article.setSummary(request.getSummary());
-        String normalizedMarkdown = normalizeMarkdown(request.getContentMarkdown(), request.getContentHtml());
-        String normalizedHtml = normalizeHtml(request.getContentHtml(), normalizedMarkdown);
+        String normalizedMarkdown = doNormalizeMarkdown(request.getContentMarkdown(), request.getContentHtml());
+        String normalizedHtml = doNormalizeHtml(request.getContentHtml(), normalizedMarkdown);
         article.setContentMarkdown(normalizedMarkdown);
         article.setContentHtml(normalizedHtml);
         article.setCategory(category);
@@ -424,11 +410,19 @@ public class ArticleService {
             article.setPublishedAt(LocalDateTime.now());
         }
 
-        Set<Tag> tags = resolveTags(request.getTags());
+        TagResolutionResult result = tagSvc.resolveTags(request.getTags());
+        Set<Tag> tags;
+        if (result instanceof TagResolutionSuccess success) {
+            tags = success.tags();
+        } else if (result instanceof TagResolutionFailure failure) {
+            throw new BusinessException(failure.message());
+        } else {
+            throw new BusinessException("标签解析失败");
+        }
         article.setTags(tags);
     }
 
-    private String normalizeMarkdown(String contentMarkdown, String contentHtml) {
+    private String doNormalizeMarkdown(String contentMarkdown, String contentHtml) {
         if (contentMarkdown != null && !contentMarkdown.isBlank()) {
             return contentMarkdown.trim();
         }
@@ -443,16 +437,16 @@ public class ArticleService {
         throw new BusinessException("Markdown 与富文本内容不能同时为空");
     }
 
-    private String normalizeHtml(String contentHtml, String normalizedMarkdown) {
+    private String doNormalizeHtml(String contentHtml, String normalizedMarkdown) {
         if (contentHtml != null && !contentHtml.isBlank()) {
             return htmlSanitizer.sanitize(contentHtml);
         }
 
-        String markdownAsHtml = markdownToSimpleHtml(normalizedMarkdown);
+        String markdownAsHtml = doMarkdownToSimpleHtml(normalizedMarkdown);
         return htmlSanitizer.sanitize(markdownAsHtml);
     }
 
-    private String markdownToSimpleHtml(String markdown) {
+    private String doMarkdownToSimpleHtml(String markdown) {
         StringBuilder html = new StringBuilder("<article>");
         String[] lines = markdown.split("\\R");
         for (String line : lines) {
@@ -476,47 +470,18 @@ public class ArticleService {
         return html.toString();
     }
 
-    private Set<Tag> resolveTags(List<String> rawTags) {
-        if (rawTags == null || rawTags.isEmpty()) {
-            return new HashSet<>();
-        }
-
-        Set<String> normalized = rawTags.stream()
-                .filter(Objects::nonNull)
-                .map(String::trim)
-                .filter(value -> !value.isBlank())
-                .map(String::toLowerCase)
-                .limit(8)
-                .collect(Collectors.toCollection(LinkedHashSet::new));
-
-        List<Tag> existing = tagRepository.findByNameIn(normalized);
-        Map<String, Tag> existingMap = existing.stream()
-                .collect(Collectors.toMap(Tag::getName, t -> t));
-
-        Set<Tag> result = new HashSet<>(existing);
-        for (String tagName : normalized) {
-            if (!existingMap.containsKey(tagName)) {
-                Tag tag = new Tag();
-                tag.setName(tagName);
-                result.add(tagRepository.save(tag));
-            }
-        }
-
-        return result;
-    }
-
-    private String generateUniqueSlug(String title) {
+    private String doGenerateUniqueSlug(String title) {
         String baseSlug = SlugUtil.toSlug(title);
         String slug = baseSlug;
         int sequence = 1;
-        while (articleRepository.existsBySlug(slug)) {
+        while (articleRepo.existsBySlug(slug)) {
             slug = baseSlug + "-" + sequence;
             sequence++;
         }
         return slug;
     }
 
-    private void validateArticlePermission(Article article, User currentUser) {
+    private void doValidateArticlePermission(Article article, User currentUser) {
         if (currentUser.getRole() == Role.ROLE_ADMIN) {
             return;
         }
@@ -526,12 +491,12 @@ public class ArticleService {
         }
     }
 
-    private Specification<Article> buildSearchSpec(String keyword,
-                                                   Long categoryId,
-                                                   LocalDate startDate,
-                                                   LocalDate endDate,
-                                                   boolean publishedOnly,
-                                                   Long authorId) {
+    private Specification<Article> doBuildSearchSpec(String keyword,
+                                                      Long categoryId,
+                                                      LocalDate startDate,
+                                                      LocalDate endDate,
+                                                      boolean publishedOnly,
+                                                      Long authorId) {
         return (root, query, criteriaBuilder) -> {
             List<Predicate> predicates = new ArrayList<>();
 
